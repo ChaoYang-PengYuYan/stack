@@ -136,8 +136,10 @@ test.describe('Asks', () => {
     await page.clock.setFixedTime(new Date(2026, 9, 28, 10)); // a weekday morning, so all four choices show (a weekend evening has two)
     const m = await open(page);
     await page.keyboard.press('z');
-    await expect(page.getByRole('group', { name: 'Defer until' })).toBeVisible();
-    await page.keyboard.press('3');
+    const group = page.getByRole('group', { name: 'Defer until' });
+    await expect(group).toBeVisible();
+    // the choices depend on the clock (no evening after 4 pm, no tomorrow on weekends): press the last one, never a fixed number
+    await page.keyboard.press(String((await group.getByRole('button').count()) - 1));
     await expect.poll(() => m.calls.find((c) => c.path === '/asks/pr-879/answer')?.body.answer).toBe('defer');
     expect(m.calls.find((c) => c.path === '/asks/pr-879/answer')?.body.until).toMatch(/^\d{4}-/);
     await expect(page.getByRole('button', { name: /Deferred · 1/ })).toBeVisible();
