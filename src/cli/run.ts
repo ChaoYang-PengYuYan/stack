@@ -55,8 +55,8 @@ const COMMANDS: Record<string, { flags: string[]; usage: string; help: string }>
   asks: { flags: ['ask', 'kind', 'from', 'project', 'why', 'recommend', 'options', 'default', 'by', 'reversible', 'link', 'priority', 'effort', 'blocks', 'detail-file', 'reopen', 'state', 'outcome', 'note', 'reply', 'limit', 'days', 'flow', 'seq', 'ref', 'apply', 'applies'], usage: 'asks put <key> --ask t --kind k --from agent [--project --why --recommend --options "A|B" --default --by --reversible yes|no --link --priority --effort --blocks --detail-file p --reopen --flow slug --seq n --ref project:line --apply "<action>" --applies "a|b"] | list [--state s] | handle <key> --outcome o [--note --reply] | archive [--days n]', help: 'ask queue for the owner: agents put and handle asks; archive moves old done asks aside' },
   email: { flags: ['account', 'mode', 'max', 'dry-run', 'extra', 'project'], usage: 'email run [--mode observe|drafts] [--max n] [--dry-run] [--project p] | voice [--extra file.json] | status [--account a] | schedule [--remote origin]', help: 'one triage pass on the signed-in mailbox (asks, drafts only, inbox-zero batches), learn your writing voice, or show status; never sends mail' },
   graph: { flags: ['client-id', 'tenant', 'with', 'cache'], usage: 'graph login --client-id <id> [--tenant t] [--with calendar,mail,drafts] [--cache path] | status | logout', help: 'sign in to Microsoft Graph (device code) for the live calendar and mail; read-only scopes' },
+  agents: { flags: ['project', 'section', 'name', 'role', 'scope', 'reports-to', 'model', 'mode', 'tools', 'prompt-file'], usage: 'agents list [--project p --section s] | add <slug> --name n --scope a,b [--role r --reports-to a --model m --mode long-running|ad-hoc --tools a,b --prompt-file p]', help: 'the team: tasks/agents/<slug>.md, .claude/agents/<slug>.md, and project Agents lines' },
   update: { flags: ['sweep', 'queries', 'engine'], usage: 'update [--sweep] [--queries] [--engine legacy|stack]', help: 'regenerate README, stack, projects, my-day (--engine stack: scores and order like `stack next`, with .stack/priorities.json)' },
-  agents: { flags: ['project', 'section', 'name', 'role', 'scope', 'model', 'mode', 'tools', 'prompt-file'], usage: 'agents list [--project p --section s] | add <slug> --name n --scope a,b [--role r --model m --mode long-running|ad-hoc --tools a,b --prompt-file p]', help: 'agents defined per project folder (tasks/agents/<slug>.md)' },
 };
 
 interface Outcome { json: Record<string, unknown>; text: string; code?: number }
@@ -284,14 +284,14 @@ async function agentsCmd(ctx: LifecycleContext, p: ReturnType<typeof parseArgs>)
       if (slug) throw new UsageError(`Unexpected argument: ${slug}`);
       const team = await listTeam(ctx);
       const items = s('project') ? agentFor(team, s('project')!, s('section')) : team;
-      return { json: { ok: true, items }, text: items.map((a) => `${a.slug}  ${a.name}  ${a.scope.join(',') || '-'}${a.defined ? '' : '  (metadata only)'}`).join('\n') };
+      return { json: { ok: true, items }, text: items.map((a) => `${a.slug}  ${a.name}  ${a.scope.join(',') || '-'}  ${a.reportsTo ?? '-'}${a.defined ? '' : '  (metadata only)'}`).join('\n') };
     }
     case 'add': {
       if (!slug) throw new UsageError('agents add needs a slug');
       const mode = s('mode');
       if (mode !== undefined && !(AGENT_MODES as readonly string[]).includes(mode)) throw new UsageError(`--mode must be one of ${AGENT_MODES.join(', ')}`);
       const pf = s('prompt-file');
-      const r = await putAgent(ctx, slug, { name: s('name'), role: s('role'), scope: list(s('scope')), model: s('model'), tools: list(s('tools')), mode: mode as AgentMode | undefined, ...(pf ? { prompt: readFileSync(pf, 'utf8') } : {}) });
+      const r = await putAgent(ctx, slug, { name: s('name'), role: s('role'), scope: list(s('scope')), reportsTo: s('reports-to'), model: s('model'), tools: list(s('tools')), mode: mode as AgentMode | undefined, ...(pf ? { prompt: readFileSync(pf, 'utf8') } : {}) });
       return { json: { ok: true, ...r }, text: `${r.created ? 'added' : 'updated'} ${r.slug}` };
     }
     default: throw new UsageError('Usage: stack agents list|add (see stack --help)');
