@@ -3,13 +3,13 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { answerAsk, asksPath, parseAsk } from '../../src/core/asks';
 import { createGraphActions, createGraphMail, htmlToText, messageDetails, sentItems } from '../../src/email/graph-mail';
-import { GRAPH_BASE, GraphDenied, type GraphRequest } from '../../src/email/guard';
+import { createGraphGuard, GRAPH_BASE, GraphDenied, type GraphRequest } from '../../src/email/guard';
 import { createServer, request as httpRequest } from 'http';
 import { createSafeHttp, isPrivateAddress, pinnedLookup } from '../../src/email/http';
 import { claudeArgs, createClaudeJson, MODELS, type ClaudeJson, type JsonCall } from '../../src/email/llm';
 import { createClassifier, createDrafter, createJudge, emailBlock, newUsage } from '../../src/email/models';
 import { lockPath, readState, rulesFor, rulesPath, runPass, statePath, takeLock, tolerant, withDetails } from '../../src/email/runner';
-import { emailCmd } from '../../src/cli/email';
+import { emailCmd, launchdPlist, offlineTransport } from '../../src/cli/email';
 import { FileTokenCache } from '../../src/graph/auth';
 import { mkCtx, msg, NOW } from './fixtures';
 
@@ -217,6 +217,37 @@ describe('runPass end to end (fake Graph, fake models)', () => {
     expect(parseAsk(archiveKey, (await storage.read(asksPath(archiveKey))).content)).toMatchObject({ state: 'done', note: 'Archived 1' });
   });
 
+  // @req FR:email-runner/cli.nosend
+  it('every request a full pass makes passes the guard allowlist, and none is a send, forward or reply', async () => {
+    const SENDISH = /\/(send|sendmail|forward|createforward|reply|replyall|createreplyall)(\/|\?|$)/i;
+    for (const mode of ['observe', 'drafts'] as const) {
+      const dataDir = tmp();
+      const { storage, ctx } = mkCtx();
+      const c0 = { ...ctx, now: () => NOW };
+      const g = fakeGraph(routes(['q', 'n']));
+      await runPass({ ctx: c0, account: 'sam@example.test', transport: g.transport, mode, llm: models().llm, dataDir });
+      const archiveKey = readState(statePath('sam@example.test', dataDir)).hygiene.batches.find((b) => b.kind === 'archive')?.key;
+      const all = [...g.seen];
+      if (archiveKey && mode === 'drafts') {
+        await answerAsk(c0, archiveKey, { answer: 'go' });
+        const g2 = fakeGraph({ ...routes([]), '/messages/delta': { value: [], '@odata.deltaLink': `${GRAPH_BASE}/me/mailfolders/inbox/messages/delta?$deltatoken=t2` } });
+        await runPass({ ctx: c0, account: 'sam@example.test', transport: g2.transport, mode, llm: models().llm, dataDir });
+        all.push(...g2.seen);
+      }
+      expect(all.length).toBeGreaterThan(0);
+      const guard = createGraphGuard({ mode, approvedMoves: new Map([['n', 'archive']]) });
+      for (const r of all) {
+        expect(() => guard.check(r)).not.toThrow();
+        // The only POSTs are reply drafts (createReply) and the approved move; never send, forward or a bare reply.
+        const path = new URL(r.url).pathname;
+        if (r.method !== 'GET') expect(path).toMatch(/\/(createReply|move)$/);
+        expect(path.replace(/\/createReply$/, '')).not.toMatch(SENDISH);
+      }
+      if (mode === 'observe') expect(all.every((r) => r.method === 'GET')).toBe(true);
+      expect(await storage.listAsks!()).toBeDefined();
+    }
+  });
+
   it('observe mode and dry runs never write to the mailbox; a dry run saves no state', async () => {
     const dataDir = tmp();
     const { ctx } = mkCtx();
@@ -302,6 +333,58 @@ describe('stack email', () => {
     expect(existsSync(statePath('sam@example.test', dataDir))).toBe(false);
     expect(g.seen[0].url).toContain('receivedDateTime+ge+');
   });
+  // @req FR:email-runner/cli.offline
+  describe('run --dry-run --offline', () => {
+    const fixture = (dir: string) => {
+      const f = join(dir, 'messages.json');
+      writeFileSync(f, JSON.stringify([
+        { id: 'o1', conversationId: 'c1', subject: 'Quarterly plan', from: { emailAddress: { name: 'Alex', address: 'alex@example.test' } }, receivedDateTime: NOW.toISOString(), bodyPreview: 'Can you review the plan by Friday?' },
+        { id: 'o2', conversationId: 'c2', subject: 'Weekly digest', from: { emailAddress: { address: 'news@example.test' } }, receivedDateTime: NOW.toISOString(), bodyPreview: 'News' },
+      ]));
+      return f;
+    };
+    const blockNetwork = () => {
+      const https = jest.requireActual<typeof import('https')>('https');
+      const net = jest.requireActual<typeof import('net')>('net');
+      const childProcess = jest.requireActual<typeof import('child_process')>('child_process');
+      const fetchSpy = jest.spyOn(globalThis, 'fetch').mockImplementation(() => { throw new Error('network used'); });
+      const httpsSpy = jest.spyOn(https, 'request').mockImplementation(() => { throw new Error('network used'); });
+      const netSpy = jest.spyOn(net, 'connect').mockImplementation(() => { throw new Error('network used'); });
+      const spawnSpy = jest.spyOn(childProcess, 'spawn').mockImplementation(() => { throw new Error('claude used'); });
+      return { all: [fetchSpy, httpsSpy, netSpy, spawnSpy], restore: () => [fetchSpy, httpsSpy, netSpy, spawnSpy].forEach((s) => s.mockRestore()) };
+    };
+    it('needs no network, no sign-in and no claude; reads the fixture; writes nothing', async () => {
+      const { storage, ctx } = mkCtx();
+      const dataDir = tmp();
+      const block = blockNetwork();
+      try {
+        const r = await emailCmd(ctx, 'run', { 'dry-run': true, offline: true, fixture: fixture(tmp()), account: 'sam@example.test' }, { cache: new FileTokenCache(join(tmp(), 'none.json')), dataDir });
+        expect(r.code).toBeUndefined();
+        expect(r.json).toMatchObject({ ok: true, dryRun: true, offline: true, messages: 2 });
+        block.all.forEach((s) => expect(s).not.toHaveBeenCalled());
+      } finally { block.restore(); }
+      expect(await storage.listAsks!()).toEqual([]);
+      expect(existsSync(statePath('sam@example.test', dataDir))).toBe(false);
+    });
+    it('runs with no fixture (empty mailbox) and a default account', async () => {
+      const { ctx } = mkCtx();
+      const r = await emailCmd(ctx, 'run', { 'dry-run': true, offline: true }, { cache: new FileTokenCache(join(tmp(), 'none.json')), dataDir: tmp() });
+      expect(r.json).toMatchObject({ ok: true, offline: true, messages: 0 });
+    });
+    it('is a usage error without --dry-run, and refuses a bad fixture', async () => {
+      const { ctx } = mkCtx();
+      await expect(emailCmd(ctx, 'run', { offline: true }, { dataDir: tmp() })).rejects.toThrow(/--offline needs --dry-run/);
+      const bad = join(tmp(), 'bad.json');
+      writeFileSync(bad, JSON.stringify({ not: 'an array' }));
+      await expect(emailCmd(ctx, 'run', { 'dry-run': true, offline: true, fixture: bad }, { dataDir: tmp() })).rejects.toThrow(/JSON array/);
+      await expect(emailCmd(ctx, 'run', { 'dry-run': true, fixture: bad }, { dataDir: tmp() })).rejects.toThrow(/--fixture needs --offline/);
+    });
+    it('the offline transport only answers guarded GETs', async () => {
+      const t = offlineTransport([]);
+      await expect(t({ method: 'POST', url: `${GRAPH_BASE}/me/messages/x/createReply`, body: { comment: 'x' } })).rejects.toThrow(/offline/);
+      await expect(t({ method: 'GET', url: `${GRAPH_BASE}/me/mailFolders/inbox/messages/delta` })).resolves.toMatchObject({ value: [] });
+    });
+  });
   it('run stops with exit 4 when one delta exceeds --max', async () => {
     const { ctx } = mkCtx();
     const g = fakeGraph({ '/messages/delta': { value: [1, 2, 3].map((i) => ({ id: `m${i}`, conversationId: `c${i}`, subject: 's', from: { emailAddress: { address: 'a@example.test' } }, receivedDateTime: NOW.toISOString(), bodyPreview: '' })), '@odata.deltaLink': `${GRAPH_BASE}/me/mailfolders/inbox/messages/delta?$deltatoken=t` } });
@@ -315,7 +398,7 @@ describe('stack email', () => {
     process.env.STACK_CLAUDE_BIN = '/opt/claude/bin/claude';
     try {
       const r = await emailCmd(ctx, 'schedule', { remote: 'origin' }, { cache: await cacheWith(['Mail.Read']), dataDir, repo: '/repo/todo' });
-      expect(r.text).toContain('<string>email</string><string>run</string><string>--dir</string><string>/repo/todo</string><string>--remote</string><string>origin</string>');
+      expect(r.text).toContain('<string>email</string><string>run</string><string>--all</string><string>--dir</string><string>/repo/todo</string><string>--remote</string><string>origin</string>');
       expect(r.text).toContain(`<string>${process.execPath}</string>`);
       expect(r.text).toContain('<string>/opt/claude/bin:/usr/bin:/bin</string>');
       expect(r.text).toContain('<integer>900</integer>');
@@ -362,5 +445,49 @@ describe('pinned lookup', () => {
     });
     server.close();
     expect(status).toBe(200);
+  });
+});
+
+// @req FR:email-runner/cli.all
+describe('stack email --all', () => {
+  const cacheAt = async (dir: string, account: string | undefined, scopes: string[], file = `graph-token-${account}.json`) => {
+    const c = new FileTokenCache(join(dir, file));
+    await c.write({ version: 1, tenant: 't', clientId: 'id', scopes, refreshToken: 'r', accessToken: 'a', expiresAt: Date.now() + 3600_000, ...(account ? { account } : {}) });
+    return c;
+  };
+  const delta = { '/messages/delta': { value: [], '@odata.deltaLink': `${GRAPH_BASE}/me/mailfolders/inbox/messages/delta?$deltatoken=t` } };
+  it('runs every mail mailbox, skips calendar-only caches, and keeps going when one is busy', async () => {
+    const { ctx } = mkCtx();
+    const dir = tmp(); const dataDir = tmp();
+    await cacheAt(dir, 'sam@outlook.com', ['Mail.ReadWrite']);
+    await cacheAt(dir, 'sam@contoso.test', ['Mail.ReadWrite']);
+    await cacheAt(dir, 'cal@contoso.test', ['Calendars.Read']);
+    const release = takeLock(lockPath('sam@contoso.test', dataDir))!;
+    const r = await emailCmd(ctx, 'run', { all: true, 'dry-run': true }, { cacheDir: dir, dataDir, transport: fakeGraph(delta).transport, llm: fakeLlm(() => ({})).llm });
+    release();
+    const list = r.json.accounts as { account: string; ok: boolean }[];
+    expect(list.map((a) => [a.account, a.ok]).sort()).toEqual([['sam@contoso.test', false], ['sam@outlook.com', true]]);
+    expect(r.code).toBe(4);
+  });
+  it('exits 0 when every mailbox passes, and 4 when none is signed in', async () => {
+    const { ctx } = mkCtx();
+    const dir = tmp();
+    await cacheAt(dir, 'sam@outlook.com', ['Mail.Read']);
+    const ok = await emailCmd(ctx, 'run', { all: true, 'dry-run': true }, { cacheDir: dir, dataDir: tmp(), transport: fakeGraph(delta).transport, llm: fakeLlm(() => ({})).llm });
+    expect(ok.code).toBeUndefined();
+    const none = await emailCmd(ctx, 'run', { all: true }, { cacheDir: tmp(), dataDir: tmp() });
+    expect(none.code).toBe(4);
+  });
+  it('schedules --all', () => {
+    expect(launchdPlist({ node: '/n', cli: '/c', claudeDir: '/b', repo: '/r', logDir: '/l' })).toContain('<string>--all</string>');
+  });
+});
+
+// @req FR:email-runner/cli.nosend
+describe('no send', () => {
+  it('the guard refuses send, forward, and bare reply; createReply stays allowed', () => {
+    const g = createGraphGuard();
+    for (const p of ['sendMail', 'messages/m1/send', 'messages/m1/forward', 'messages/m1/reply', 'messages/m1/replyAll']) expect(() => g.check({ method: 'POST', url: `${GRAPH_BASE}/me/${p}`, body: {} })).toThrow(GraphDenied);
+    expect(() => g.check({ method: 'POST', url: `${GRAPH_BASE}/me/messages/m1/createReply`, body: { comment: 'x' } })).not.toThrow();
   });
 });
