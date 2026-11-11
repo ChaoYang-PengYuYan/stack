@@ -155,6 +155,28 @@ describe('per-device dedupe', () => {
     await n.notify([ask('k', { by: min(45) })]);
     expect(r.calls).toHaveLength(4);
   });
+  // @req FR:iphone-access/notify.serial
+  it('overlapping checks push each pair once', async () => {
+    const { devices } = await mk(1);
+    const calls: string[] = [];
+    const sender: PushSender = { send: async (sub) => { calls.push(sub.endpoint); await new Promise((ok) => setTimeout(ok, 10)); return { status: 201 }; } };
+    const n = createPushNotifier({ devices, sender, now: () => NOW, ledger: mkLedger() });
+    const [a, b] = await Promise.all([n.notify([ask('k')]), n.notify([ask('k')])]);
+    expect(calls).toHaveLength(1);
+    expect(a.sent + b.sent).toBe(1);
+    expect(a.skipped + b.skipped).toBe(1);
+  });
+  // @req FR:iphone-access/notify.serial
+  it('a hung check blocks the next check for waitMs only', async () => {
+    const { devices } = await mk(1);
+    let first = true;
+    const r = recorder();
+    const sender: PushSender = { send: (sub, payload) => { if (first) { first = false; return new Promise<never>(() => undefined); } return r.sender.send(sub, payload); } };
+    const n = createPushNotifier({ devices, sender, now: () => NOW, waitMs: 20 });
+    void n.notify([ask('k')]);
+    expect(await n.notify([ask('k')])).toEqual({ sent: 1, removed: 0, failed: 0, skipped: 0 });
+    expect(r.calls).toHaveLength(1);
+  });
   // @req FR:iphone-access/notify.dedupe
   it('builds each payload from that device own unsent asks', async () => {
     const { devices } = await mk(1);
