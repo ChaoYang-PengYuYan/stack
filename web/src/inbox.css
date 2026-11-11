@@ -25,5 +25,5 @@
 .btn.link { background: none; border-color: transparent; color: var(--accent); }
 @media (max-width: 719px) {
   .in-row { padding: 12px; }
-  .in-actions .btn, .in-draft-actions .btn { min-height: var(--tap); }
+  .in-actions .btn, .in-draft-actions .btn, .in-menu button { min-height: var(--tap); }
 }
